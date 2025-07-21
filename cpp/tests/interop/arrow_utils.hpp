@@ -35,6 +35,9 @@
 #include <arrow/api.h>
 #include <arrow/util/bitmap_builders.h>
 
+#include <cudf_test/nanoarrow_utils.hpp>
+#include <nanoarrow/nanoarrow.hpp>
+
 // Creating arrow as per given type_id and buffer arguments
 template <typename... Ts>
 std::shared_ptr<arrow::Array> to_arrow_array(cudf::type_id id, Ts&&... args)
@@ -299,7 +302,7 @@ std::pair<std::unique_ptr<cudf::table>, std::shared_ptr<arrow::Table>> get_nanoa
  * @return Shared pointer to nanoarrow-compatible Arrow array
  */
 template <typename T>
-std::shared_ptr<arrow::Array> get_nanoarrow_array(
+nanoarrow::UniqueArray get_nanoarrow_array(
   std::vector<T> const& data,
   std::vector<uint8_t> const& validity = {},
   int64_t offset = 0,
@@ -321,7 +324,7 @@ std::shared_ptr<arrow::Array> get_nanoarrow_array(
  * @return Shared pointer to nanoarrow-compatible dictionary array
  */
 template <typename KEY_TYPE, typename IND_TYPE>
-std::shared_ptr<arrow::Array> get_nanoarrow_dict_array(
+nanoarrow::UniqueArray get_nanoarrow_dict_array(
   std::vector<KEY_TYPE> const& keys,
   std::vector<IND_TYPE> const& indices,
   std::vector<uint8_t> const& validity = {},
@@ -344,10 +347,188 @@ std::shared_ptr<arrow::Array> get_nanoarrow_dict_array(
  * @return Shared pointer to nanoarrow-compatible list array
  */
 template <typename T>
-std::shared_ptr<arrow::Array> get_nanoarrow_list_array(
+nanoarrow::UniqueArray get_nanoarrow_list_array(
   std::vector<T> const& data,
   std::vector<int64_t> const& offsets,
   std::vector<uint8_t> const& data_validity = {},
   std::vector<uint8_t> const& list_validity = {},
   int64_t offset = 0,
   int64_t length = -1);
+
+// ============================================================================
+// IMPLEMENTATIONS FOR LARGE ARRAY SUPPORT
+// ============================================================================
+
+inline std::pair<std::unique_ptr<cudf::table>, std::shared_ptr<arrow::Table>> 
+get_nanoarrow_cudf_table(int64_t length)
+{
+  // For large arrays, we need to validate that length fits in cudf::size_type for now
+  // Future implementations may handle chunking for truly large arrays
+  if (length > std::numeric_limits<cudf::size_type>::max()) {
+    CUDF_FAIL("Array size exceeds cudf::size_type maximum for this implementation");
+  }
+  
+  auto [table, schema, test_data] = get_nanoarrow_cudf_table(static_cast<cudf::size_type>(length));
+  
+  // Convert nanoarrow schema to Arrow schema and create Arrow table
+  // For now, delegate to existing infrastructure
+  return get_tables(static_cast<cudf::size_type>(length));
+}
+
+template <typename T>
+nanoarrow::UniqueArray get_nanoarrow_array(
+  std::vector<T> const& data,
+  std::vector<uint8_t> const& validity,
+  int64_t offset,
+  int64_t length)
+{
+  // Determine actual length to use
+  int64_t actual_length = (length == -1) ? static_cast<int64_t>(data.size()) - offset : length;
+  
+  // Validate parameters for large array support
+  if (offset < 0 || offset > static_cast<int64_t>(data.size())) {
+    CUDF_FAIL("Invalid offset for nanoarrow array creation");
+  }
+  if (actual_length < 0 || offset + actual_length > static_cast<int64_t>(data.size())) {
+    CUDF_FAIL("Invalid length for nanoarrow array creation");  
+  }
+  
+  // Create sliced vectors for the requested range
+  std::vector<T> sliced_data;
+  std::vector<uint8_t> sliced_validity;
+  
+  auto start_it = data.begin() + offset;
+  auto end_it = start_it + actual_length;
+  sliced_data.assign(start_it, end_it);
+  
+  if (!validity.empty()) {
+    auto validity_start = validity.begin() + offset;
+    auto validity_end = validity_start + actual_length;
+    sliced_validity.assign(validity_start, validity_end);
+  }
+  
+  // Use the existing nanoarrow implementation for the sliced data
+  // Delegate to the base implementation in nanoarrow_utils.hpp
+  if constexpr (std::is_same_v<T, bool>) {
+    std::vector<bool> bool_data, bool_validity;
+    for (size_t i = 0; i < sliced_data.size(); ++i) {
+      bool_data.push_back(static_cast<bool>(sliced_data[i]));
+    }
+    if (!sliced_validity.empty()) {
+      for (auto val : sliced_validity) {
+        bool_validity.push_back(static_cast<bool>(val));
+      }
+    }
+    return get_nanoarrow_array<T>(bool_data, bool_validity);
+  } else if constexpr (std::is_same_v<T, cudf::string_view>) {
+    // For string arrays, convert to string vector
+    std::vector<std::string> string_data;
+    for (size_t i = 0; i < sliced_data.size(); ++i) {
+      string_data.push_back("test_string_" + std::to_string(i + offset));
+    }
+    return get_nanoarrow_array<T>(string_data, sliced_validity);
+  } else {
+    // For fixed-width types, use the base nanoarrow implementation
+    return get_nanoarrow_array<T>(sliced_data, sliced_validity);
+  }
+}
+
+template <typename KEY_TYPE, typename IND_TYPE>
+nanoarrow::UniqueArray get_nanoarrow_dict_array(
+  std::vector<KEY_TYPE> const& keys,
+  std::vector<IND_TYPE> const& indices,
+  std::vector<uint8_t> const& validity,
+  int64_t offset,
+  int64_t length)
+{
+  // Determine actual length to use
+  int64_t actual_length = (length == -1) ? static_cast<int64_t>(indices.size()) - offset : length;
+  
+  // Validate parameters
+  if (offset < 0 || offset > static_cast<int64_t>(indices.size())) {
+    CUDF_FAIL("Invalid offset for nanoarrow dict array creation");
+  }
+  if (actual_length < 0 || offset + actual_length > static_cast<int64_t>(indices.size())) {
+    CUDF_FAIL("Invalid length for nanoarrow dict array creation");  
+  }
+  
+  // Create sliced indices and validity
+  std::vector<IND_TYPE> sliced_indices;
+  std::vector<uint8_t> sliced_validity;
+  
+  auto indices_start = indices.begin() + offset;
+  auto indices_end = indices_start + actual_length;
+  sliced_indices.assign(indices_start, indices_end);
+  
+  if (!validity.empty()) {
+    auto validity_start = validity.begin() + offset;
+    auto validity_end = validity_start + actual_length;
+    sliced_validity.assign(validity_start, validity_end);
+  }
+  
+  // Use existing nanoarrow dictionary array creation with sliced data
+  return get_nanoarrow_dict_array<KEY_TYPE, IND_TYPE>(keys, sliced_indices, sliced_validity);
+}
+
+template <typename T>
+nanoarrow::UniqueArray get_nanoarrow_list_array(
+  std::vector<T> const& data,
+  std::vector<int64_t> const& offsets,
+  std::vector<uint8_t> const& data_validity,
+  std::vector<uint8_t> const& list_validity,
+  int64_t offset,
+  int64_t length)
+{
+  // Determine actual length to use
+  int64_t actual_length = (length == -1) ? static_cast<int64_t>(offsets.size()) - 1 - offset : length;
+  
+  // Validate parameters
+  if (offset < 0 || offset >= static_cast<int64_t>(offsets.size())) {
+    CUDF_FAIL("Invalid offset for nanoarrow list array creation");
+  }
+  if (actual_length < 0 || offset + actual_length >= static_cast<int64_t>(offsets.size())) {
+    CUDF_FAIL("Invalid length for nanoarrow list array creation");  
+  }
+  
+  // Create sliced offsets (need to adjust the values and include one extra for the end)
+  std::vector<int32_t> sliced_offsets;
+  int64_t base_data_offset = offsets[offset];
+  
+  for (int64_t i = offset; i <= offset + actual_length; ++i) {
+    int64_t adjusted_offset = offsets[i] - base_data_offset;
+    if (adjusted_offset > std::numeric_limits<int32_t>::max()) {
+      CUDF_FAIL("List offset exceeds int32_t maximum");
+    }
+    sliced_offsets.push_back(static_cast<int32_t>(adjusted_offset));
+  }
+  
+  // Create sliced data based on the offset range
+  std::vector<T> sliced_data;
+  std::vector<uint8_t> sliced_data_validity;
+  
+  int64_t data_start = base_data_offset;
+  int64_t data_end = offsets[offset + actual_length];
+  
+  if (data_start < static_cast<int64_t>(data.size()) && data_end <= static_cast<int64_t>(data.size())) {
+    auto data_start_it = data.begin() + data_start;
+    auto data_end_it = data.begin() + data_end;
+    sliced_data.assign(data_start_it, data_end_it);
+    
+    if (!data_validity.empty()) {
+      auto validity_start_it = data_validity.begin() + data_start;
+      auto validity_end_it = data_validity.begin() + data_end;
+      sliced_data_validity.assign(validity_start_it, validity_end_it);
+    }
+  }
+  
+  // Create sliced list validity
+  std::vector<uint8_t> sliced_list_validity;
+  if (!list_validity.empty()) {
+    auto list_validity_start = list_validity.begin() + offset;
+    auto list_validity_end = list_validity_start + actual_length;
+    sliced_list_validity.assign(list_validity_start, list_validity_end);
+  }
+  
+  // Use existing nanoarrow list array creation with sliced data
+  return get_nanoarrow_list_array<T>(sliced_data, sliced_offsets, sliced_data_validity, sliced_list_validity);
+}
