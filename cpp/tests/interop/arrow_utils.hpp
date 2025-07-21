@@ -272,3 +272,82 @@ std::shared_ptr<arrow::Array> get_decimal_arrow_array(
     data_type, data.size(), std::vector<std::shared_ptr<arrow::Buffer>>{mask_buffer, data_buffer});
   return arrow::MakeArray(array_data);
 }
+
+/**
+ * @brief Creates a nanoarrow-compatible cuDF table for large array testing
+ *
+ * Supports array sizes exceeding 2^31 rows for comprehensive interop testing
+ * of integer overflow scenarios in Arrow to cuDF conversion.
+ *
+ * @param length Number of rows, supports int64_t for large arrays
+ * @return Pair of cuDF table and corresponding nanoarrow table structure
+ */
+std::pair<std::unique_ptr<cudf::table>, std::shared_ptr<arrow::Table>> get_nanoarrow_cudf_table(
+  int64_t length = 10000);
+
+/**
+ * @brief Creates a nanoarrow array supporting large array sizes
+ *
+ * Template function that creates nanoarrow-compatible arrays for testing
+ * large sliced arrays that exceed cuDF's 32-bit size_type limitations.
+ *
+ * @tparam T Data type for the array elements
+ * @param data Vector of data elements
+ * @param validity Optional validity mask for null values
+ * @param offset Starting offset for sliced arrays (supports int64_t)
+ * @param length Number of elements (supports int64_t for large arrays)
+ * @return Shared pointer to nanoarrow-compatible Arrow array
+ */
+template <typename T>
+std::shared_ptr<arrow::Array> get_nanoarrow_array(
+  std::vector<T> const& data,
+  std::vector<uint8_t> const& validity = {},
+  int64_t offset = 0,
+  int64_t length = -1);
+
+/**
+ * @brief Creates a nanoarrow dictionary array supporting large arrays
+ *
+ * Creates dictionary arrays with support for large index arrays exceeding
+ * 2^31 elements to test integer overflow scenarios in dictionary interop.
+ *
+ * @tparam KEY_TYPE Type of dictionary keys
+ * @tparam IND_TYPE Type of dictionary indices (supports int64_t)
+ * @param keys Vector of dictionary key values
+ * @param indices Vector of indices into the dictionary
+ * @param validity Optional validity mask for the indices
+ * @param offset Starting offset for sliced arrays (supports int64_t)
+ * @param length Number of elements (supports int64_t for large arrays)
+ * @return Shared pointer to nanoarrow-compatible dictionary array
+ */
+template <typename KEY_TYPE, typename IND_TYPE>
+std::shared_ptr<arrow::Array> get_nanoarrow_dict_array(
+  std::vector<KEY_TYPE> const& keys,
+  std::vector<IND_TYPE> const& indices,
+  std::vector<uint8_t> const& validity = {},
+  int64_t offset = 0,
+  int64_t length = -1);
+
+/**
+ * @brief Creates a nanoarrow list array supporting large arrays
+ *
+ * Creates list arrays with support for large offset arrays and child arrays
+ * exceeding 2^31 elements to test integer overflow in list interop.
+ *
+ * @tparam T Type of list element data
+ * @param data Vector of list element values
+ * @param offsets Vector of list offsets (supports int64_t values)
+ * @param data_validity Optional validity mask for data elements
+ * @param list_validity Optional validity mask for list elements
+ * @param offset Starting offset for sliced arrays (supports int64_t)
+ * @param length Number of list elements (supports int64_t for large arrays)
+ * @return Shared pointer to nanoarrow-compatible list array
+ */
+template <typename T>
+std::shared_ptr<arrow::Array> get_nanoarrow_list_array(
+  std::vector<T> const& data,
+  std::vector<int64_t> const& offsets,
+  std::vector<uint8_t> const& data_validity = {},
+  std::vector<uint8_t> const& list_validity = {},
+  int64_t offset = 0,
+  int64_t length = -1);
