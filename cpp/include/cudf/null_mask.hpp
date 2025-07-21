@@ -17,12 +17,15 @@
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/export.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/device_buffer.hpp>
 
+#include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace CUDF_EXPORT cudf {
@@ -59,6 +62,28 @@ size_type state_null_count(mask_state state, size_type size);
  * @return The necessary number of bytes
  */
 std::size_t bitmask_allocation_size_bytes(size_type number_of_bits,
+                                          std::size_t padding_boundary = 64);
+
+/**
+ * @brief 64-bit variant for computing the required bytes necessary to represent
+ * the specified number of bits with a given padding boundary
+ *
+ * This function is specifically designed to handle large Arrow arrays with offsets
+ * and lengths that exceed the 32-bit size_type maximum (2^31). It performs all
+ * calculations using 64-bit arithmetic to prevent integer overflow when processing
+ * sliced Arrow arrays with large offsets.
+ *
+ * @note The Arrow specification for the null bitmask requires a 64B padding
+ * boundary. This variant is essential for Arrow interop functionality when dealing
+ * with arrays that have been sliced with non-zero offsets exceeding size_type limits.
+ *
+ * @param number_of_bits The number of bits that need to be represented (64-bit)
+ * @param padding_boundary The value returned will be rounded up to a multiple
+ * of this value
+ * @return The necessary number of bytes as 64-bit value
+ * @throws cudf::logic_error if the computed size exceeds std::size_t maximum
+ */
+std::size_t bitmask_allocation_size_bytes(int64_t number_of_bits,
                                           std::size_t padding_boundary = 64);
 
 /**
