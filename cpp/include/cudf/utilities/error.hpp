@@ -21,6 +21,7 @@
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -30,6 +31,8 @@ namespace CUDF_EXPORT cudf {
  * @addtogroup utility_error
  * @{
  * @file
+ * @brief Error handling utilities for cuDF operations, including overflow validation
+ *        for large array operations and interop functionality.
  */
 
 /**
@@ -141,6 +144,10 @@ struct data_type_error : std::invalid_argument {
  *
  * // throws std::runtime_error
  * CUDF_EXPECTS(p != nullptr, "Unexpected nullptr", std::runtime_error);
+ *
+ * // overflow validation for large array operations
+ * CUDF_EXPECTS(buffer_size <= std::numeric_limits<size_type>::max(), 
+ *              "Buffer size exceeds maximum");
  * ```
  * @param ... This macro accepts either two or three arguments:
  *   - The first argument must be an expression that evaluates to true or
