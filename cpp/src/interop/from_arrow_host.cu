@@ -62,9 +62,10 @@ struct dispatch_copy_from_arrow_host {
     auto* bitmap = array->buffers[validity_buffer_idx];
     if (bitmap == nullptr) { return std::make_unique<rmm::device_buffer>(0, stream, mr); }
 
-    auto const bitmask_size = array->length + array->offset;
-    auto const allocation_size =
-      bitmask_allocation_size_bytes(static_cast<size_type>(bitmask_size));
+    // Use 64-bit arithmetic to prevent overflow when offset > INT32_MAX
+    auto const bitmask_size = static_cast<int64_t>(array->length) + 
+                              static_cast<int64_t>(array->offset);
+    auto const allocation_size = bitmask_allocation_size_bytes(bitmask_size);
     auto mask = std::make_unique<rmm::device_buffer>(allocation_size, stream, mr);
     CUDF_CUDA_TRY(cudaMemcpyAsync(mask->data(),
                                   reinterpret_cast<uint8_t const*>(bitmap),
@@ -88,8 +89,14 @@ struct dispatch_copy_from_arrow_host {
   {
     using DeviceType = device_storage_type_t<T>;
 
-    size_type const num_rows   = input->length;
-    size_type const offset     = input->offset;
+    // Verify the slice length fits in size_type (actual data to copy)
+    CUDF_EXPECTS(input->length <= std::numeric_limits<size_type>::max(),
+                 "Arrow array length exceeds maximum cuDF column size");
+    size_type const num_rows = static_cast<size_type>(input->length);
+
+    // Calculate byte offset using 64-bit arithmetic to handle large offsets safely
+    int64_t const byte_offset = static_cast<int64_t>(input->offset) * sizeof(DeviceType);
+    
     size_type const null_count = input->null_count;
     auto data_buffer           = input->buffers[fixed_width_data_buffer_idx];
 
@@ -98,7 +105,7 @@ struct dispatch_copy_from_arrow_host {
     auto mutable_column_view = col->mutable_view();
     CUDF_CUDA_TRY(
       cudaMemcpyAsync(mutable_column_view.data<DeviceType>(),
-                      reinterpret_cast<uint8_t const*>(data_buffer) + offset * sizeof(DeviceType),
+                      reinterpret_cast<uint8_t const*>(data_buffer) + byte_offset,
                       sizeof(DeviceType) * num_rows,
                       cudaMemcpyDefault,
                       stream.value()));
@@ -108,10 +115,13 @@ struct dispatch_copy_from_arrow_host {
 
       // if array is sliced, we have to copy the whole mask and then take copy
       auto out_mask =
-        (offset == 0)
+        (input->offset == 0)
           ? std::move(*tmp_mask)
           : cudf::detail::copy_bitmask(
-              static_cast<bitmask_type*>(tmp_mask->data()), offset, offset + num_rows, stream, mr);
+              static_cast<bitmask_type*>(tmp_mask->data()), 
+              static_cast<size_type>(input->offset), 
+              static_cast<size_type>(input->offset) + num_rows, 
+              stream, mr);
 
       col->set_null_mask(std::move(out_mask), null_count);
     }
@@ -127,7 +137,9 @@ std::unique_ptr<column> dispatch_copy_from_arrow_host::operator()<bool>(ArrowSch
                                                                         bool skip_mask)
 {
   auto data_buffer         = input->buffers[fixed_width_data_buffer_idx];
-  auto const buffer_length = bitmask_allocation_size_bytes(input->length + input->offset);
+  // Use 64-bit arithmetic to prevent overflow in boolean column allocation
+  auto const buffer_length = bitmask_allocation_size_bytes(
+    static_cast<int64_t>(input->length) + static_cast<int64_t>(input->offset));
 
   auto data = rmm::device_buffer(buffer_length, stream, mr);
   CUDF_CUDA_TRY(cudaMemcpyAsync(data.data(),
@@ -144,8 +156,8 @@ std::unique_ptr<column> dispatch_copy_from_arrow_host::operator()<bool>(ArrowSch
   auto const has_nulls = skip_mask ? false : input->buffers[validity_buffer_idx] != nullptr;
   if (has_nulls) {
     auto out_mask = detail::copy_bitmask(static_cast<bitmask_type*>(get_mask_buffer(input)->data()),
-                                         input->offset,
-                                         input->offset + input->length,
+                                         static_cast<size_type>(input->offset),
+                                         static_cast<size_type>(input->offset + input->length),
                                          stream,
                                          mr);
 
@@ -231,8 +243,8 @@ std::unique_ptr<column> dispatch_copy_from_arrow_host::operator()<cudf::struct_v
   auto out_mask = std::move(*(get_mask_buffer(input)));
   if (input->buffers[validity_buffer_idx] != nullptr) {
     out_mask = detail::copy_bitmask(static_cast<bitmask_type*>(out_mask.data()),
-                                    input->offset,
-                                    input->offset + input->length,
+                                    static_cast<size_type>(input->offset),
+                                    static_cast<size_type>(input->offset + input->length),
                                     stream,
                                     mr);
   }
