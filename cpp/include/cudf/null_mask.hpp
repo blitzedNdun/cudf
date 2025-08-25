@@ -62,6 +62,22 @@ std::size_t bitmask_allocation_size_bytes(size_type number_of_bits,
                                           std::size_t padding_boundary = 64);
 
 /**
+ * @brief 64-bit variant for computing the required bytes necessary to represent
+ * the specified number of bits with a given padding boundary
+ *
+ * This function handles large Arrow arrays with offsets and lengths that exceed
+ * the 32-bit size_type maximum (2^31). It performs all calculations using 64-bit
+ * arithmetic to prevent integer overflow when processing sliced Arrow arrays.
+ *
+ * @param number_of_bits The number of bits that need to be represented (64-bit)
+ * @param padding_boundary The value returned will be rounded up to a multiple of this
+ * @return The necessary number of bytes as 64-bit value
+ * @throws cudf::logic_error if the computed size exceeds std::size_t maximum
+ */
+std::size_t bitmask_allocation_size_bytes(int64_t number_of_bits,
+                                          std::size_t padding_boundary = 64);
+
+/**
  * @brief Returns the number of `bitmask_type` words required to represent the
  * specified number of bits
  *
