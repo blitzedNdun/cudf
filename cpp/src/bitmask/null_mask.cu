@@ -80,6 +80,28 @@ size_type num_bitmask_words(size_type number_of_bits)
                                                      detail::size_in_bits<bitmask_type>());
 }
 
+// 64-bit overload for large Arrow arrays
+std::size_t bitmask_allocation_size_bytes(int64_t number_of_bits, 
+                                         std::size_t padding_boundary)
+{
+  CUDF_EXPECTS(padding_boundary > 0, "Invalid padding boundary");
+  CUDF_EXPECTS(number_of_bits >= 0, 
+               "Number of bits cannot be negative for bitmask allocation");
+  
+  // Perform calculations in 64-bit arithmetic to prevent overflow
+  int64_t necessary_bytes = (number_of_bits + CHAR_BIT - 1) / CHAR_BIT;
+  
+  // Round up to padding boundary using 64-bit arithmetic
+  int64_t padded_bytes = padding_boundary * 
+                        ((necessary_bytes + padding_boundary - 1) / padding_boundary);
+  
+  // Ensure result fits in size_t
+  CUDF_EXPECTS(padded_bytes <= static_cast<int64_t>(std::numeric_limits<std::size_t>::max()),
+               "Bitmask allocation size exceeds maximum size_t value");
+  
+  return static_cast<std::size_t>(padded_bytes);
+}
+
 namespace detail {
 
 // Create a device_buffer for a null mask
