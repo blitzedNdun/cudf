@@ -33,6 +33,9 @@
 #include <cudf/types.hpp>
 
 #include <thrust/iterator/counting_iterator.h>
+#include <climits>
+#include <sys/sysinfo.h>
+#include <unistd.h>
 
 // create a cudf::table and equivalent arrow table with host memory
 std::tuple<std::unique_ptr<cudf::table>, nanoarrow::UniqueSchema, nanoarrow::UniqueArray>
@@ -880,3 +883,353 @@ INSTANTIATE_TEST_CASE_P(FromArrowHostDeviceTest,
                                           std::make_tuple(0, 0),
                                           std::make_tuple(0, 3000),
                                           std::make_tuple(10000, 10000)));
+
+// Helper function to check if sufficient memory is available for large array tests
+bool has_sufficient_memory_for_large_arrays() 
+{
+#ifdef __linux__
+  struct sysinfo si;
+  if (sysinfo(&si) == 0) {
+    // Calculate available memory in bytes
+    // We need at least 4GB of available memory for 2^31 + 1 elements
+    uint64_t available_memory = (uint64_t)si.freeram * si.mem_unit;
+    uint64_t required_memory = (1ULL << 31) + 1; // 2^31 + 1 bytes minimum
+    return available_memory >= (required_memory * 2); // 2x safety margin
+  }
+#endif
+
+  // Fallback to POSIX method
+#ifdef _SC_AVPHYS_PAGES
+  long pages_avail = sysconf(_SC_AVPHYS_PAGES);
+  long page_size = sysconf(_SC_PAGE_SIZE);
+  if (pages_avail > 0 && page_size > 0) {
+    uint64_t available_memory = (uint64_t)pages_avail * page_size;
+    uint64_t required_memory = (1ULL << 31) + 1;
+    return available_memory >= (required_memory * 2);
+  }
+#endif
+
+  // Conservative approach: skip if we can't determine memory availability
+  return false;
+}
+
+struct LargeArrowArrayTest : public cudf::test::BaseFixture {};
+
+TEST_F(LargeArrowArrayTest, FixedWidthInt8OverflowAtBoundary)
+{
+  // Skip test if insufficient memory available
+  if (!has_sufficient_memory_for_large_arrays()) {
+    GTEST_SKIP() << "Insufficient memory available for large array test (requires >4GB RAM)";
+  }
+
+  // Test case: Create Arrow array with INT32_MAX-1 offset (boundary condition)
+  // This tests the fix for integer overflow when offset approaches INT32_MAX
+  const int64_t array_size = static_cast<int64_t>(INT32_MAX) + 100;
+  const int64_t slice_offset = static_cast<int64_t>(INT32_MAX) - 1;
+  const int64_t slice_length = 2;
+
+  try {
+    // Create a large Arrow int8 array
+    std::vector<int8_t> data(array_size, 42); // Fill with value 42
+    
+    ArrowArray arrow_array;
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&arrow_array, NANOARROW_TYPE_INT8));
+    NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&arrow_array));
+    
+    // Allocate and set the data buffer directly
+    auto data_buffer = ArrowArrayBuffer(&arrow_array, 1);
+    NANOARROW_THROW_NOT_OK(ArrowBufferResize(data_buffer, array_size, false));
+    std::memcpy(data_buffer->data, data.data(), array_size);
+    
+    arrow_array.length = array_size;
+    arrow_array.null_count = 0;
+    
+    NANOARROW_THROW_NOT_OK(
+      ArrowArrayFinishBuilding(&arrow_array, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+    // Apply slice at the boundary condition
+    arrow_array.offset = slice_offset;
+    arrow_array.length = slice_length;
+
+    // Create schema
+    ArrowSchema schema;
+    NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_INT8));
+
+    // Convert from Arrow to cuDF - this should NOT segfault with the fix
+    auto result_column = cudf::from_arrow_column(&schema, &arrow_array);
+    
+    // Validate the result
+    EXPECT_EQ(result_column->size(), slice_length);
+    EXPECT_EQ(result_column->type(), cudf::data_type{cudf::type_id::INT8});
+    
+    // Verify data integrity - should contain the expected values
+    auto host_data = cudf::test::to_host<int8_t>(result_column->view());
+    for (int i = 0; i < slice_length; ++i) {
+      EXPECT_EQ(host_data.first[i], 42);
+    }
+
+    // Test round-trip conversion to ensure no data corruption
+    nanoarrow::UniqueArray result_arrow;
+    nanoarrow::UniqueSchema result_schema;
+    std::tie(result_schema, result_arrow) = cudf::to_arrow_host(cudf::table_view{{result_column->view()}});
+    
+    EXPECT_EQ(result_arrow->children[0]->length, slice_length);
+
+  } catch (const std::exception& e) {
+    FAIL() << "Fixed-width int8 overflow test failed with exception: " << e.what();
+  }
+}
+
+TEST_F(LargeArrowArrayTest, FixedWidthInt8OverflowAtExactBoundary) 
+{
+  if (!has_sufficient_memory_for_large_arrays()) {
+    GTEST_SKIP() << "Insufficient memory available for large array test (requires >4GB RAM)";
+  }
+
+  // Test case: offset exactly at INT32_MAX
+  const int64_t array_size = static_cast<int64_t>(INT32_MAX) + 2;
+  const int64_t slice_offset = static_cast<int64_t>(INT32_MAX);
+  const int64_t slice_length = 1;
+
+  try {
+    std::vector<int8_t> data(array_size, 99);
+    
+    ArrowArray arrow_array;
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&arrow_array, NANOARROW_TYPE_INT8));
+    NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&arrow_array));
+    
+    auto data_buffer = ArrowArrayBuffer(&arrow_array, 1);
+    NANOARROW_THROW_NOT_OK(ArrowBufferResize(data_buffer, array_size, false));
+    std::memcpy(data_buffer->data, data.data(), array_size);
+    
+    arrow_array.length = array_size;
+    arrow_array.null_count = 0;
+    
+    NANOARROW_THROW_NOT_OK(
+      ArrowArrayFinishBuilding(&arrow_array, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+    arrow_array.offset = slice_offset;
+    arrow_array.length = slice_length;
+
+    ArrowSchema schema;
+    NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_INT8));
+
+    auto result_column = cudf::from_arrow_column(&schema, &arrow_array);
+    
+    EXPECT_EQ(result_column->size(), slice_length);
+    auto host_data = cudf::test::to_host<int8_t>(result_column->view());
+    EXPECT_EQ(host_data.first[0], 99);
+
+  } catch (const std::exception& e) {
+    FAIL() << "Fixed-width int8 exact boundary test failed: " << e.what();
+  }
+}
+
+TEST_F(LargeArrowArrayTest, FixedWidthInt8OverflowBeyondBoundary)
+{
+  if (!has_sufficient_memory_for_large_arrays()) {
+    GTEST_SKIP() << "Insufficient memory available for large array test (requires >4GB RAM)";
+  }
+
+  // Test case: offset beyond INT32_MAX 
+  const int64_t array_size = static_cast<int64_t>(INT32_MAX) + 10;
+  const int64_t slice_offset = static_cast<int64_t>(INT32_MAX) + 5;
+  const int64_t slice_length = 2;
+
+  try {
+    std::vector<int8_t> data(array_size, 77);
+    
+    ArrowArray arrow_array;
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&arrow_array, NANOARROW_TYPE_INT8));
+    NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&arrow_array));
+    
+    auto data_buffer = ArrowArrayBuffer(&arrow_array, 1);
+    NANOARROW_THROW_NOT_OK(ArrowBufferResize(data_buffer, array_size, false));
+    std::memcpy(data_buffer->data, data.data(), array_size);
+    
+    arrow_array.length = array_size;
+    arrow_array.null_count = 0;
+    
+    NANOARROW_THROW_NOT_OK(
+      ArrowArrayFinishBuilding(&arrow_array, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+    arrow_array.offset = slice_offset;
+    arrow_array.length = slice_length;
+
+    ArrowSchema schema;
+    NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_INT8));
+
+    auto result_column = cudf::from_arrow_column(&schema, &arrow_array);
+    
+    EXPECT_EQ(result_column->size(), slice_length);
+    auto host_data = cudf::test::to_host<int8_t>(result_column->view());
+    for (int i = 0; i < slice_length; ++i) {
+      EXPECT_EQ(host_data.first[i], 77);
+    }
+
+  } catch (const std::exception& e) {
+    FAIL() << "Fixed-width int8 beyond boundary test failed: " << e.what();
+  }
+}
+
+TEST_F(LargeArrowArrayTest, BooleanOverflowAtBoundary)
+{
+  if (!has_sufficient_memory_for_large_arrays()) {
+    GTEST_SKIP() << "Insufficient memory available for large array test (requires >4GB RAM)";
+  }
+
+  // Test case: Boolean array with large offset to test bitmask allocation overflow
+  // This tests the fix for massive memory allocation attempts (18+ exabytes)
+  const int64_t array_size = static_cast<int64_t>(INT32_MAX) + 100;
+  const int64_t slice_offset = static_cast<int64_t>(INT32_MAX) - 1;
+  const int64_t slice_length = 2;
+
+  try {
+    // Create boolean Arrow array
+    ArrowArray arrow_array;
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&arrow_array, NANOARROW_TYPE_BOOL));
+    NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&arrow_array));
+    
+    // Calculate bitmask size for the full array
+    int64_t bitmask_bytes = (array_size + 7) / 8;
+    auto data_buffer = ArrowArrayBuffer(&arrow_array, 1);
+    NANOARROW_THROW_NOT_OK(ArrowBufferResize(data_buffer, bitmask_bytes, false));
+    
+    // Fill bitmask with alternating true/false pattern
+    uint8_t* bitmask = reinterpret_cast<uint8_t*>(data_buffer->data);
+    std::memset(bitmask, 0xAA, bitmask_bytes); // 10101010 pattern
+    
+    arrow_array.length = array_size;
+    arrow_array.null_count = 0;
+    
+    NANOARROW_THROW_NOT_OK(
+      ArrowArrayFinishBuilding(&arrow_array, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+    // Apply slice at boundary condition
+    arrow_array.offset = slice_offset;
+    arrow_array.length = slice_length;
+
+    ArrowSchema schema;
+    NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_BOOL));
+
+    // Convert from Arrow to cuDF - this should NOT cause massive memory allocation
+    auto result_column = cudf::from_arrow_column(&schema, &arrow_array);
+    
+    // Validate the result
+    EXPECT_EQ(result_column->size(), slice_length);
+    EXPECT_EQ(result_column->type(), cudf::data_type{cudf::type_id::BOOL8});
+    
+    // Test round-trip conversion
+    nanoarrow::UniqueArray result_arrow;
+    nanoarrow::UniqueSchema result_schema;
+    std::tie(result_schema, result_arrow) = cudf::to_arrow_host(cudf::table_view{{result_column->view()}});
+    
+    EXPECT_EQ(result_arrow->children[0]->length, slice_length);
+
+  } catch (const std::bad_alloc& e) {
+    FAIL() << "Boolean overflow test caused memory allocation error: " << e.what();
+  } catch (const std::exception& e) {
+    FAIL() << "Boolean overflow test failed with exception: " << e.what();
+  }
+}
+
+TEST_F(LargeArrowArrayTest, BooleanOverflowAtExactBoundary)
+{
+  if (!has_sufficient_memory_for_large_arrays()) {
+    GTEST_SKIP() << "Insufficient memory available for large array test (requires >4GB RAM)";
+  }
+
+  // Test boolean array with offset exactly at INT32_MAX
+  const int64_t array_size = static_cast<int64_t>(INT32_MAX) + 2;
+  const int64_t slice_offset = static_cast<int64_t>(INT32_MAX);
+  const int64_t slice_length = 1;
+
+  try {
+    ArrowArray arrow_array;
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&arrow_array, NANOARROW_TYPE_BOOL));
+    NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&arrow_array));
+    
+    int64_t bitmask_bytes = (array_size + 7) / 8;
+    auto data_buffer = ArrowArrayBuffer(&arrow_array, 1);
+    NANOARROW_THROW_NOT_OK(ArrowBufferResize(data_buffer, bitmask_bytes, false));
+    
+    uint8_t* bitmask = reinterpret_cast<uint8_t*>(data_buffer->data);
+    std::memset(bitmask, 0xFF, bitmask_bytes); // All true
+    
+    arrow_array.length = array_size;
+    arrow_array.null_count = 0;
+    
+    NANOARROW_THROW_NOT_OK(
+      ArrowArrayFinishBuilding(&arrow_array, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+    arrow_array.offset = slice_offset;
+    arrow_array.length = slice_length;
+
+    ArrowSchema schema;
+    NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_BOOL));
+
+    auto result_column = cudf::from_arrow_column(&schema, &arrow_array);
+    
+    EXPECT_EQ(result_column->size(), slice_length);
+    auto host_data = cudf::test::to_host<bool>(result_column->view());
+    EXPECT_TRUE(host_data.first[0]);
+
+  } catch (const std::bad_alloc& e) {
+    FAIL() << "Boolean exact boundary test caused memory allocation error: " << e.what();
+  } catch (const std::exception& e) {
+    FAIL() << "Boolean exact boundary test failed: " << e.what();
+  }
+}
+
+TEST_F(LargeArrowArrayTest, BooleanOverflowBeyondBoundary)
+{
+  if (!has_sufficient_memory_for_large_arrays()) {
+    GTEST_SKIP() << "Insufficient memory available for large array test (requires >4GB RAM)";
+  }
+
+  // Test boolean array with offset beyond INT32_MAX
+  const int64_t array_size = static_cast<int64_t>(INT32_MAX) + 20;
+  const int64_t slice_offset = static_cast<int64_t>(INT32_MAX) + 10;
+  const int64_t slice_length = 3;
+
+  try {
+    ArrowArray arrow_array;
+    NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(&arrow_array, NANOARROW_TYPE_BOOL));
+    NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(&arrow_array));
+    
+    int64_t bitmask_bytes = (array_size + 7) / 8;
+    auto data_buffer = ArrowArrayBuffer(&arrow_array, 1);
+    NANOARROW_THROW_NOT_OK(ArrowBufferResize(data_buffer, bitmask_bytes, false));
+    
+    uint8_t* bitmask = reinterpret_cast<uint8_t*>(data_buffer->data);
+    std::memset(bitmask, 0x55, bitmask_bytes); // 01010101 pattern
+    
+    arrow_array.length = array_size;
+    arrow_array.null_count = 0;
+    
+    NANOARROW_THROW_NOT_OK(
+      ArrowArrayFinishBuilding(&arrow_array, NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+    arrow_array.offset = slice_offset;
+    arrow_array.length = slice_length;
+
+    ArrowSchema schema;
+    NANOARROW_THROW_NOT_OK(ArrowSchemaInitFromType(&schema, NANOARROW_TYPE_BOOL));
+
+    auto result_column = cudf::from_arrow_column(&schema, &arrow_array);
+    
+    EXPECT_EQ(result_column->size(), slice_length);
+    
+    // Test round-trip to ensure data integrity
+    nanoarrow::UniqueArray result_arrow;
+    nanoarrow::UniqueSchema result_schema;
+    std::tie(result_schema, result_arrow) = cudf::to_arrow_host(cudf::table_view{{result_column->view()}});
+    
+    EXPECT_EQ(result_arrow->children[0]->length, slice_length);
+
+  } catch (const std::bad_alloc& e) {
+    FAIL() << "Boolean beyond boundary test caused memory allocation error: " << e.what();
+  } catch (const std::exception& e) {
+    FAIL() << "Boolean beyond boundary test failed: " << e.what();
+  }
+}
